@@ -128,5 +128,3 @@ python mt_relay.py
 
 MIT — use freely at your own risk.
 Always comply with your broker’s terms of service.
-
-```
