@@ -1,0 +1,136 @@
+# mt_relay.py
+# Fast, local MT4→MT5 relay with optional symbol mapping for the receiver.
+# Run:  py -m pip install fastapi uvicorn[standard] pydantic
+#       py mt_relay.py
+
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timezone
+import uvicorn
+import threading
+import time
+import os
+
+# ====== CONFIG ======
+AUTH_TOKEN = os.getenv("RELAY_AUTH_TOKEN", "CHANGE_ME")   # must match both EAs
+
+# Optional: server-side symbol translation for the *receiver*.
+# Example: {"XAUUSD": "XAUUSD.m", "GER30": "DE40"}
+SYMBOL_MAP: Dict[str, str] = {
+    # "XAUUSD": "XAUUSD.m",
+    # "GER30": "DE40",
+}
+# If True, apply SYMBOL_MAP on /pull; published symbols are stored as-is.
+APPLY_SYMBOL_MAP_ON_PULL = True
+
+# If you ever decide to send "Authorization: Bearer <token>" from other clients,
+# keep this True so both "CHANGE_ME" and "Bearer CHANGE_ME" are accepted.
+ACCEPT_BEARER = True
+
+# ====================
+
+app = FastAPI(title="MT4→MT5 Relay", version="1.1")
+
+signals_lock = threading.Lock()
+signals: List[Dict[str, Any]] = []
+last_id = 0
+
+class Signal(BaseModel):
+    # lifecycle
+    action: str = Field(..., regex="^(OPEN|MODIFY|CLOSE|DELETE|PARTIAL)$")
+    # origin
+    source: str = "MT4"
+    broker_time: float = Field(default_factory=lambda: time.time())
+    # identity
+    symbol: str
+    order_type: int  # MT4/MT5 numeric: 0=BUY,1=SELL,2=BUY_LIMIT,3=SELL_LIMIT,4=BUY_STOP,5=SELL_STOP
+    source_ticket: int
+    magic: int = 0
+    comment: str = ""
+    # sizing / price
+    lots: float
+    price: float = 0.0
+    sl: float = 0.0
+    tp: float = 0.0
+    # modify sequencing
+    version: int = 1
+
+class PullQuery(BaseModel):
+    since_id: int = 0
+    max_batch: int = 50
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _normalize_auth(token: Optional[str]) -> str:
+    """Accept 'CHANGE_ME' or 'Bearer CHANGE_ME' depending on EA or client."""
+    if token is None:
+        return ""
+    t = token.strip()
+    if ACCEPT_BEARER and t.lower().startswith("bearer "):
+        return t[7:].strip()
+    return t
+
+def _auth_guard(token: Optional[str]):
+    t = _normalize_auth(token)
+    if t != AUTH_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+def _translate_symbol(sym: str) -> str:
+    if APPLY_SYMBOL_MAP_ON_PULL and sym in SYMBOL_MAP:
+        return SYMBOL_MAP[sym]
+    return sym
+
+@app.post("/publish")
+def publish(sig: Signal, authorization: Optional[str] = Header(None)):
+    """
+    Sender (MT4 EA) posts here. We store signals as-is and assign a relay_id.
+    """
+    _auth_guard(authorization)
+    global last_id
+    entry = sig.dict()
+    with signals_lock:
+        last_id += 1
+        entry["relay_id"] = last_id
+        entry["received_at"] = _now_iso()
+        signals.append(entry)
+    return {"ok": True, "relay_id": last_id}
+
+@app.post("/pull")
+def pull(query: PullQuery, authorization: Optional[str] = Header(None)):
+    """
+    Receiver (MT5 EA) pulls new items since a given relay_id.
+    We can optionally rewrite 'symbol' via SYMBOL_MAP just before serving.
+    """
+    _auth_guard(authorization)
+    with signals_lock:
+        batch = [s for s in signals if s["relay_id"] > query.since_id]
+        # cap batch size
+        lim = max(1, min(query.max_batch, 200))
+        batch = batch[:lim]
+
+        # shallow copy each item if we need to translate symbol
+        if APPLY_SYMBOL_MAP_ON_PULL and SYMBOL_MAP:
+            out: List[Dict[str, Any]] = []
+            for s in batch:
+                if s.get("symbol") in SYMBOL_MAP:
+                    c = dict(s)
+                    c["raw_symbol"] = s["symbol"]              # keep original for debugging
+                    c["symbol"] = _translate_symbol(s["symbol"])
+                    out.append(c)
+                else:
+                    out.append(s)
+            batch = out
+
+        latest = batch[-1]["relay_id"] if batch else query.since_id
+
+    return {"ok": True, "signals": batch, "latest_id": latest}
+
+@app.get("/health")
+def health():
+    return {"ok": True, "utc": _now_iso(), "queue_len": len(signals), "symbol_map_enabled": APPLY_SYMBOL_MAP_ON_PULL, "mapped": list(SYMBOL_MAP.keys())}
+
+if __name__ == "__main__":
+    # Localhost only; keep it inside the VPS
+    uvicorn.run("mt_relay:app", host="127.0.0.1", port=8787, reload=False, workers=1)
