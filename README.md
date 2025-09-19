@@ -1,4 +1,3 @@
-```markdown
 # MT4 → MT5 Copy Trading Bridge
 
 A fast, local copy trading bridge that mirrors trades from an **MT4 account** into an **MT5 account** running on the same Windows VPS.
