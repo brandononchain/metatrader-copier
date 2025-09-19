@@ -130,8 +130,3 @@ MIT — use freely at your own risk.
 Always comply with your broker’s terms of service.
 
 ```
-
----
-
-Would you like me to also add a **default `symbol_map` section in the Python relay** (e.g. `{"XAUUSD":"XAUUSD.m","GER30":"DE40"}`) so users don’t need to edit the EA for non-suffix mappings? That way the Readme can document how to maintain symbol translation entirely in Python.
-```
